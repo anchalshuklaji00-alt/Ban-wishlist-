@@ -32,11 +32,36 @@ from proto import FreeFire_pb2
 from google.protobuf import json_format
 import urllib3
 from PIL import Image
+import threading
 
 # SSL Warnings hide karne ke liye
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
+
+
+# ============================================================
+# BACKGROUND TOKEN AUTO-REFRESH (App band nahi hogi)
+# Startup pe tokens generate hote hain, phir har 7 ghante baad
+# ============================================================
+def _background_token_refresh():
+    """Startup pe aur phir har 7 ghante mein uidpass.json se tokens.json update karta hai."""
+    import time
+    while True:
+        try:
+            app.logger.info("[AUTO-REFRESH] Tokens refresh ho rahe hain...")
+            count = update_tokens(10)
+            app.logger.info(f"[AUTO-REFRESH] {count} tokens generate hue.")
+        except Exception as e:
+            app.logger.error(f"[AUTO-REFRESH] Error: {e}")
+        time.sleep(25200)  # 7 ghante baad wapas
+
+
+def start_token_refresh_thread():
+    """Daemon thread shuru karo — Flask ke saath chalti rahegi, band nahi hogi."""
+    t = threading.Thread(target=_background_token_refresh, daemon=True)
+    t.start()
+    app.logger.info("[STARTUP] Background token refresh thread shuru ho gayi.")
 
 # Memory cache for Vercel 
 MEMORY_TOKENS = []
@@ -414,8 +439,8 @@ def index():
     return jsonify({
         "Developer": "Rolex",
         "endpoints": {
-            "ban": "/ban?uid=<uid>&server_name=IND",
-            "blacklist": "/blacklist?uid=<uid>&server_name=IND",
+            "checkban": "/checkban?uid=<uid>&server_name=IND",
+            "checkblacklist": "/checkblacklist?uid=<uid>&server_name=IND",
             "update_bio": "/update_bio?uid=<uid>&token=<token>&bio=<bio>&server_name=IND",
             "wishlist_json": "/wishlist?uid=<uid>&server_name=IND",
             "wishlist_zip":  "/wishlist_zip?uid=<uid>&server_name=IND"
@@ -430,7 +455,7 @@ def trigger_cron():
 # ============================================================
 # 1. BAN CHECK ROUTE
 # ============================================================
-@app.route('/ban', methods=['GET'])
+@app.route('/checkban', methods=['GET'])
 def handle_ban_check():
     uid = request.args.get("uid")
     if not uid: return jsonify({"error": "UID is required"}), 400
@@ -473,7 +498,7 @@ def handle_ban_check():
 # ============================================================
 # 2. BLACKLIST CHECK ROUTE (NEW)
 # ============================================================
-@app.route('/blacklist', methods=['GET'])
+@app.route('/checkblacklist', methods=['GET'])
 def handle_blacklist_check():
     uid = request.args.get("uid")
     if not uid: return jsonify({"error": "UID is required"}), 400
@@ -810,4 +835,5 @@ def handle_wishlist_zip():
     )
 
 if __name__ == '__main__':
+    start_token_refresh_thread()
     app.run(debug=True, use_reloader=False)
