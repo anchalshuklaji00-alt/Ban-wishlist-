@@ -39,32 +39,37 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
+# Memory cache for Vercel 
+MEMORY_TOKENS = []
+
 
 # ============================================================
-# BACKGROUND TOKEN AUTO-REFRESH (App band nahi hogi)
-# Startup pe tokens generate hote hain, phir har 7 ghante baad
+# BACKGROUND TOKEN AUTO-REFRESH THREAD
+# Startup pe tokens generate hote hain, phir har 6 ghante baad
+# App band nahi hogi — daemon thread hai
 # ============================================================
 def _background_token_refresh():
-    """Startup pe aur phir har 7 ghante mein uidpass.json se tokens.json update karta hai."""
+    """Har 6 ghante mein uidpass.json se tokens refresh karta hai."""
     import time
+    # Startup pe ek baar zaroor chalao
+    try:
+        count = update_tokens(10)
+        app.logger.info(f"[STARTUP] {count} tokens generate hue uidpass.json se.")
+    except Exception as e:
+        app.logger.error(f"[STARTUP] Token generate error: {e}")
     while True:
+        time.sleep(21600)  # 6 ghante = 21600 seconds
         try:
-            app.logger.info("[AUTO-REFRESH] Tokens refresh ho rahe hain...")
+            app.logger.info("[AUTO-REFRESH] 6 ghante complete — tokens refresh ho rahe hain...")
             count = update_tokens(10)
-            app.logger.info(f"[AUTO-REFRESH] {count} tokens generate hue.")
+            app.logger.info(f"[AUTO-REFRESH] {count} naye tokens ban gaye.")
         except Exception as e:
             app.logger.error(f"[AUTO-REFRESH] Error: {e}")
-        time.sleep(25200)  # 7 ghante baad wapas
 
 
 def start_token_refresh_thread():
-    """Daemon thread shuru karo — Flask ke saath chalti rahegi, band nahi hogi."""
     t = threading.Thread(target=_background_token_refresh, daemon=True)
     t.start()
-    app.logger.info("[STARTUP] Background token refresh thread shuru ho gayi.")
-
-# Memory cache for Vercel 
-MEMORY_TOKENS = []
 
 # ============================================================
 # JWT TOKEN GENERATOR LOGIC 
@@ -158,6 +163,49 @@ def load_tokens():
     except Exception as e:
         pass
     return []
+
+
+def get_valid_token():
+    """
+    Token deta hai. Agar tokens nahi mile (expired ya empty) toh
+    turant uidpass.json se naye generate karta hai.
+    """
+    global MEMORY_TOKENS
+    tokens = load_tokens()
+    if tokens:
+        return tokens[0]['token']
+    # Tokens nahi mile — abhi naye banao
+    app.logger.warning("[TOKEN] Tokens nahi mile, abhi generate kar raha hoon...")
+    MEMORY_TOKENS = []
+    count = update_tokens(10)
+    if count > 0:
+        tokens = load_tokens()
+        if tokens:
+            return tokens[0]['token']
+    app.logger.error("[TOKEN] Naya token bhi nahi ban paya!")
+    return None
+
+
+def get_token_with_fallback(uid, server_name, check_fn):
+    """
+    Pehle existing token se try karo. Agar error aaye (expired/rejected)
+    toh turant force-refresh karke dobara try karo.
+    check_fn: check_fn(uid, server_name, token) -> (result, error)
+    """
+    global MEMORY_TOKENS
+    token = get_valid_token()
+    if not token:
+        return None, "No tokens available aur naya bhi nahi ban paya"
+    result, error = check_fn(uid, server_name, token)
+    if error:
+        app.logger.warning(f"[TOKEN] Error: {error} — force-refresh kar raha hoon...")
+        MEMORY_TOKENS = []
+        count = update_tokens(10)
+        if count > 0:
+            token = get_valid_token()
+            if token:
+                result, error = check_fn(uid, server_name, token)
+    return result, error
 
 def encrypt_message(plaintext):
     try:
@@ -439,8 +487,8 @@ def index():
     return jsonify({
         "Developer": "Rolex",
         "endpoints": {
-            "checkban": "/checkban?uid=<uid>&server_name=IND",
-            "checkblacklist": "/checkblacklist?uid=<uid>&server_name=IND",
+            "ban": "/ban?uid=<uid>&server_name=IND",
+            "blacklist": "/blacklist?uid=<uid>&server_name=IND",
             "update_bio": "/update_bio?uid=<uid>&token=<token>&bio=<bio>&server_name=IND",
             "wishlist_json": "/wishlist?uid=<uid>&server_name=IND",
             "wishlist_zip":  "/wishlist_zip?uid=<uid>&server_name=IND"
@@ -455,29 +503,14 @@ def trigger_cron():
 # ============================================================
 # 1. BAN CHECK ROUTE
 # ============================================================
-@app.route('/checkban', methods=['GET'])
+@app.route('/ban', methods=['GET'])
 def handle_ban_check():
     uid = request.args.get("uid")
     if not uid: return jsonify({"error": "UID is required"}), 400
 
     try:
         server_name = request.args.get("server_name", "IND").upper()
-        tokens = load_tokens()
-        if not tokens:
-            update_tokens(5)
-            tokens = load_tokens()
-            if not tokens: return jsonify({"error": "No tokens available"}), 500
-
-        token = tokens[0]['token']
-        result, error = check_ban_status(uid, server_name, token)
-
-        if error:
-            update_tokens(5)
-            tokens = load_tokens()
-            if tokens:
-                token = tokens[0]['token']
-                result, error = check_ban_status(uid, server_name, token)
-
+        result, error = get_token_with_fallback(uid, server_name, check_ban_status)
         if error: return jsonify({"error": error}), 500
 
         return jsonify({
@@ -498,49 +531,45 @@ def handle_ban_check():
 # ============================================================
 # 2. BLACKLIST CHECK ROUTE (NEW)
 # ============================================================
-@app.route('/checkblacklist', methods=['GET'])
+@app.route('/blacklist', methods=['GET'])
 def handle_blacklist_check():
     uid = request.args.get("uid")
     if not uid: return jsonify({"error": "UID is required"}), 400
     server_name = request.args.get("server_name", "IND").upper()
 
     try:
-        tokens = load_tokens()
-        if not tokens:
-            update_tokens(5)
-            tokens = load_tokens()
-            if not tokens: return jsonify({"error": "No tokens available"}), 500
+        def _blacklist_check(uid, server_name, token):
+            url = get_server_url(server_name, "GetMatchmakingBlacklist")
+            encrypt = enc(uid)
+            if not encrypt: return None, "Encryption failed"
+            edata = bytes.fromhex(encrypt)
+            headers = {
+                'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+                'Connection': "Keep-Alive",
+                'Accept-Encoding': "gzip",
+                'Authorization': f"Bearer {token}",
+                'Content-Type': "application/x-www-form-urlencoded",
+                'Expect': "100-continue",
+                'X-Unity-Version': "2018.4.11f1",
+                'X-GA': "v1 1",
+                'ReleaseVersion': "OB52"
+            }
+            resp = requests.post(url, data=edata, headers=headers, verify=False)
+            if resp.status_code == 200:
+                return {"content": resp.content, "status_code": resp.status_code}, None
+            return None, f"Server returned {resp.status_code}"
 
-        token = tokens[0]['token']
-        url = get_server_url(server_name, "GetMatchmakingBlacklist")
-        
-        encrypt = enc(uid)
-        if not encrypt: return jsonify({"error": "Encryption failed"}), 500
-        edata = bytes.fromhex(encrypt)
+        result, error = get_token_with_fallback(uid, server_name, _blacklist_check)
+        if error: return jsonify({"error": error}), 500
 
-        headers = {
-            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Authorization': f"Bearer {token}",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'Expect': "100-continue",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB52"
-        }
-
-        resp = requests.post(url, data=edata, headers=headers, verify=False)
-        if resp.status_code == 200:
-            is_blacklisted = len(resp.content) > 10 
-            return jsonify({
-                "Developer": "Rolex ❤️‍🔥",
-                "uid": uid,
-                "is_blacklisted": is_blacklisted,
-                "raw_size": len(resp.content),
-                "status": "Success"
-            })
-        return jsonify({"error": f"Server returned {resp.status_code}"}), 500
+        is_blacklisted = len(result["content"]) > 10
+        return jsonify({
+            "Developer": "Rolex ❤️‍🔥",
+            "uid": uid,
+            "is_blacklisted": is_blacklisted,
+            "raw_size": len(result["content"]),
+            "status": "Success"
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -837,3 +866,4 @@ def handle_wishlist_zip():
 if __name__ == '__main__':
     start_token_refresh_thread()
     app.run(debug=True, use_reloader=False)
+
